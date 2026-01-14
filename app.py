@@ -1,6 +1,7 @@
 import streamlit as st
 import requests
 from datetime import datetime, time as dtime
+from streamlit_extras.app_autorefresh import st_autorefresh
 import matplotlib.pyplot as plt
 
 # ================== PAGE CONFIG ==================
@@ -99,6 +100,25 @@ def fetch_pcr(base_strike, dte, manual_range):
     except Exception as e:
         return None, str(e)
 
+def pcr_trade_signal(pcr):
+    if pcr < 0.75:
+        return "PUT", "🔴 Bearish ΔOI — Put Writing Weak", "error"
+    elif 0.75 <= pcr <= 1.25:
+        return "NO TRADE", "⚪ Neutral Zone — Avoid Trades", "warning"
+    else:
+        return "CALL", "🟢 Bullish ΔOI — Strong Put Addition", "success"
+if data:
+    signal, message, level = pcr_trade_signal(data["pcr"])
+
+    if level == "success":
+        st.success(f"📈 TRADE SIGNAL: {signal} | PCR = {data['pcr']}")
+
+    elif level == "warning":
+        st.warning(f"⛔ NO TRADE ZONE | PCR = {data['pcr']}")
+
+    else:
+        st.error(f"📉 TRADE SIGNAL: {signal} | PCR = {data['pcr']}")
+
 # ================== SESSION STATE ==================
 if "session" not in st.session_state:
     st.session_state.session = create_nse_session()
@@ -133,7 +153,21 @@ refresh = st.sidebar.slider(
 status = market_status()
 st.title("📊 NIFTY ΔOI PCR Dashboard")
 st.markdown(f"**Market Mode:** 🟢 `{status}`")
-
+if data:
+    st.markdown(
+        f"""
+        <div style="
+            padding:12px;
+            border-radius:10px;
+            background:#1c1f26;
+            border-left:6px solid {'#2ecc71' if data['pcr']>1.25 else '#e74c3c' if data['pcr']<0.75 else '#f1c40f'};
+            margin-bottom:15px;
+            font-size:16px;">
+            <b>PCR ΔOI Bias:</b> {signal} | <b>Value:</b> {data['pcr']}
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
 # ================== TRADER MINDSET ==================
 with st.expander("🧠 Trader Mindset — Execution > P&L", expanded=False):
     st.markdown("""
@@ -180,4 +214,7 @@ with st.expander("📜 Logs"):
         st.text(l)
 
 # ================== AUTO REFRESH (SAFE) ==================
-st.autorefresh(interval=refresh * 1000, key="pcr_refresh")
+st_autorefresh(
+    interval=refresh * 1000,
+    key="pcr_refresh"
+)
