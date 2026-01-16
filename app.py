@@ -5,6 +5,14 @@ import time
 import matplotlib.pyplot as plt
 import pandas as pd
 import numpy as np
+from pytz import timezone
+
+# ================== TIMEZONE SETUP ==================
+IST = timezone('Asia/Kolkata')
+
+def get_ist_time():
+    """Get current time in IST (UTC+5:30)"""
+    return datetime.now(IST)
 
 # ================== PAGE CONFIG ==================
 st.set_page_config(
@@ -19,7 +27,7 @@ st.markdown("""
 @import url('https://fonts.googleapis.com/css2?family=Libre+Baskerville&display=swap');
 
 html, body, [class*="css"] {
-    font-family: 'Libre Baskerville', serif;
+    font-family: 'Libre+Baskerville', serif;
 }
 
 section[data-testid="stSidebar"] {
@@ -104,12 +112,32 @@ section[data-testid="stSidebar"] {
     background: linear-gradient(90deg, #1c1f26 0%, rgba(231, 76, 60, 0.05) 100%);
 }
 
+/* Custom scrollbar */
+::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+}
+
+::-webkit-scrollbar-track {
+    background: #1c1f26;
+    border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb {
+    background: #3498db;
+    border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+    background: #2980b9;
+}
+
 </style>
 """, unsafe_allow_html=True)
 
 # ================== UTILITIES ==================
 def log(msg, level="INFO"):
-    timestamp = datetime.now()
+    timestamp = get_ist_time()
     st.session_state.logs.append({
         "time": timestamp,
         "level": level,
@@ -117,28 +145,53 @@ def log(msg, level="INFO"):
     })
 
 def market_status():
-    now = datetime.now().time()
-    today = datetime.now()
+    """Check market status in IST timezone"""
+    ist_time = get_ist_time()
+    now = ist_time.time()
+    today = ist_time
+    
+    # Market hours in IST: 9:15 AM to 3:30 PM (actual trading 9:15-15:30)
+    market_open = dtime(9, 15)
+    market_close = dtime(15, 30)
+    
+    is_market_hours = market_open <= now <= market_close
     
     # Check if today is Tuesday (weekly expiry day for NIFTY)
     is_tuesday = today.weekday() == 1  # Monday=0, Tuesday=1
     
-    # Market hours
-    is_market_hours = dtime(9, 20) <= now <= dtime(15, 25)
-    
     if is_market_hours:
+        # Calculate time to market close
+        market_close_dt = today.replace(hour=15, minute=30, second=0, microsecond=0)
+        if market_close_dt < today:
+            market_close_dt += timedelta(days=1)
+        
+        time_left = market_close_dt - today
+        hours, remainder = divmod(time_left.seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        
         return {
             "status": "LIVE",
             "color": "#2ecc71",
             "icon": "🟢",
-            "is_tuesday": is_tuesday
+            "is_tuesday": is_tuesday,
+            "time_left": f"{hours:02d}:{minutes:02d}:{seconds:02d}"
         }
     else:
+        # Calculate time to next market open
+        next_open = today.replace(hour=9, minute=15, second=0, microsecond=0)
+        if next_open < today:
+            next_open += timedelta(days=1)
+        
+        time_to_open = next_open - today
+        hours, remainder = divmod(time_to_open.seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        
         return {
             "status": "AFTER_MARKET",
             "color": "#e74c3c",
             "icon": "🔴",
-            "is_tuesday": is_tuesday
+            "is_tuesday": is_tuesday,
+            "time_to_open": f"{hours:02d}:{minutes:02d}:{seconds:02d}"
         }
 
 def strike_range_by_dte(dte):
@@ -194,9 +247,14 @@ def create_sparkline(data_points, height=30):
 def create_nse_session():
     s = requests.Session()
     s.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept-Language": "en-US,en;q=0.9",
-        "Accept": "application/json, text/plain, */*"
+        "Accept-Encoding": "gzip, deflate, br",
+        "Accept": "application/json, text/plain, */*",
+        "Referer": "https://www.nseindia.com/",
+        "Origin": "https://www.nseindia.com",
+        "DNT": "1",
+        "Connection": "keep-alive"
     })
     try:
         s.get("https://www.nseindia.com", timeout=5)
@@ -206,9 +264,19 @@ def create_nse_session():
 
 # ================== DATA FETCH ==================
 def fetch_pcr(base_strike, dte, manual_range):
+    """Fetch PCR data from NSE - updated every 3 minutes"""
     url = "https://www.nseindia.com/api/option-chain-indices?symbol=NIFTY"
+    
     try:
-        r = st.session_state.session.get(url, timeout=10)
+        # Add cache busting to get fresh data
+        headers = {
+            **st.session_state.session.headers,
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0"
+        }
+        
+        r = st.session_state.session.get(url, headers=headers, timeout=15)
         
         if r.status_code != 200:
             return None, f"HTTP Error: {r.status_code}"
@@ -219,6 +287,15 @@ def fetch_pcr(base_strike, dte, manual_range):
         
         records = data["records"]["data"]
         spot = data["records"]["underlyingValue"]
+        timestamp = data["records"]["timestamp"]
+        
+        # Parse timestamp from NSE response
+        try:
+            # NSE timestamp format: "30-Jan-2024 15:30:00"
+            data_time = datetime.strptime(timestamp, "%d-%b-%Y %H:%M:%S")
+            data_time = IST.localize(data_time)
+        except:
+            data_time = get_ist_time()
         
         rng = manual_range if manual_range is not None else strike_range_by_dte(dte)
         strikes = [base_strike + i * 50 for i in range(-rng, rng + 1)]
@@ -228,6 +305,7 @@ def fetch_pcr(base_strike, dte, manual_range):
         for row in records:
             if row.get("strikePrice") in strikes:
                 if "PE" in row:
+                    # Use changeinOpenInterest for ΔOI
                     put_doi += row["PE"].get("changeinOpenInterest", 0)
                 if "CE" in row:
                     call_doi += row["CE"].get("changeinOpenInterest", 0)
@@ -238,7 +316,8 @@ def fetch_pcr(base_strike, dte, manual_range):
         pcr_value = put_doi / call_doi if call_doi != 0 else 0
         
         return {
-            "time": datetime.now(),
+            "time": data_time,  # Use NSE timestamp
+            "timestamp": timestamp,
             "pcr": round(pcr_value, 2),
             "put_doi": put_doi,
             "call_doi": call_doi,
@@ -246,6 +325,10 @@ def fetch_pcr(base_strike, dte, manual_range):
             "strikes": rng
         }, "OK"
         
+    except requests.exceptions.Timeout:
+        return None, "Request Timeout - NSE server slow"
+    except requests.exceptions.ConnectionError:
+        return None, "Connection Error - Check internet"
     except Exception as e:
         return None, f"Error: {str(e)}"
 
@@ -266,6 +349,7 @@ if "session" not in st.session_state:
     st.session_state.last_refresh = None
     st.session_state.refresh_count = 0
     st.session_state.animation_key = 0
+    st.session_state.last_data_time = None
 
 # ================== SIDEBAR ==================
 with st.sidebar:
@@ -281,6 +365,9 @@ with st.sidebar:
         <div style="display: flex; align-items: center; justify-content: space-between;">
             <div>
                 <h4 style="margin:0;">Market Status</h4>
+                <p style="margin:3px 0 0 0; font-size:12px; color:#95a5a6;">
+                    {get_ist_time().strftime('%d %b %Y')}
+                </p>
             </div>
             <span class="status-badge {badge_class}">
                 {badge_icon} {status_info['status']}
@@ -291,7 +378,7 @@ with st.sidebar:
     
     # Tuesday (Expiry Day) Warning
     if status_info['is_tuesday']:
-        st.warning("⚠️ **TODAY IS EXPIRY DAY** - Exercise Extreme Caution!", icon="⚠️")
+        st.error("⚠️ **TODAY IS EXPIRY DAY** - NO TRADES ALLOWED!", icon="⚠️")
     
     st.markdown("---")
     
@@ -301,7 +388,7 @@ with st.sidebar:
         min_value=10000,
         max_value=50000,
         step=50,
-        value=25500,
+        value=22500,
         help="ATM (At The Money) strike price"
     )
     
@@ -316,47 +403,73 @@ with st.sidebar:
     # Refresh Controls
     st.subheader("🔄 Refresh Settings")
     
+    # Auto-refresh aligned with NSE 3-minute cycle
     auto_refresh = st.toggle("Auto Refresh", value=True, 
-                            help="Automatically refresh data")
+                            help="Aligns with NSE's 3-minute data update cycle")
     
     if auto_refresh:
-        refresh_interval = st.slider(
-            "Refresh Interval (seconds)",
-            30, 300, 180,
-            help="Time between automatic updates"
+        refresh_interval = st.select_slider(
+            "Refresh Interval",
+            options=[60, 120, 180, 240, 300],
+            value=180,
+            help="NSE updates data every 3 minutes (180 seconds)"
         )
     
-    if st.button("🔄 Refresh Now", type="primary", use_container_width=True):
-        st.session_state.refresh_count += 1
-        st.session_state.animation_key += 1
-        st.rerun()
+    # Manual refresh button
+    refresh_col1, refresh_col2 = st.columns(2)
+    with refresh_col1:
+        if st.button("🔄 Refresh Now", use_container_width=True):
+            st.session_state.refresh_count += 1
+            st.session_state.animation_key += 1
+            st.rerun()
+    with refresh_col2:
+        if st.button("🗑️ Clear Cache", use_container_width=True):
+            st.session_state.session = create_nse_session()
+            st.success("Cache cleared!")
     
     # Data Stats
     if st.session_state.data_history:
         st.markdown("---")
         st.subheader("📊 Session Stats")
         total_data = len(st.session_state.data_history)
-        last_update = st.session_state.data_history[-1]["time"].strftime("%H:%M:%S")
-        st.metric("Data Points", total_data)
-        st.metric("Last Update", last_update)
+        if st.session_state.data_history:
+            last_update = st.session_state.data_history[-1]["time"].strftime("%H:%M:%S")
+            st.metric("Data Points", total_data)
+            st.metric("Last Update", last_update)
+        
+        # Show next expected NSE update
+        if auto_refresh and st.session_state.last_data_time:
+            next_update = st.session_state.last_data_time + timedelta(seconds=180)
+            current = get_ist_time()
+            if next_update > current:
+                seconds_left = (next_update - current).seconds
+                st.caption(f"⏳ Next NSE update: {seconds_left}s")
 
 # ================== MAIN DASHBOARD ==================
 # Header with animated status sphere
 status_info = market_status()
-current_time = datetime.now().time()
+current_time = get_ist_time()
 sphere_color = "#2ecc71" if status_info['status'] == 'LIVE' else "#e74c3c"
+
+# Display IST time
+ist_time_str = current_time.strftime("%d %b %Y, %I:%M:%S %p IST")
 
 st.markdown(f"""
 <div class="slide-in">
-    <h1 style="margin-bottom:10px;">📊 NIFTY ΔOI PCR Dashboard</h1>
-    <div style="display:flex; align-items:center; gap:20px; margin-bottom:20px;">
-        <div style="display:flex; align-items:center;">
-            <div style="width:12px; height:12px; border-radius:50%; 
-                background:{sphere_color}; margin-right:8px; 
-                animation: pulse 2s infinite;"></div>
-            <span style="font-size:14px; color:{sphere_color}; font-weight:bold;">
-                {status_info['status']} • {current_time.strftime('%H:%M:%S')}
-            </span>
+    <h1 style="margin-bottom:5px;">📊 NIFTY ΔOI PCR Dashboard</h1>
+    <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:20px;">
+        <div style="display:flex; align-items:center; gap:15px;">
+            <div style="display:flex; align-items:center;">
+                <div style="width:12px; height:12px; border-radius:50%; 
+                    background:{sphere_color}; margin-right:8px; 
+                    animation: pulse 2s infinite;"></div>
+                <span style="font-size:14px; color:{sphere_color}; font-weight:bold;">
+                    {status_info['status']}
+                </span>
+            </div>
+            <div style="font-size:14px; color:#95a5a6;">
+                {ist_time_str}
+            </div>
         </div>
         <div style="font-size:14px; color:#95a5a6;">
             Auto-refresh: {'ON' if auto_refresh else 'OFF'}
@@ -366,29 +479,50 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 # ================== DATA FETCH WITH LOADER ==================
-with st.spinner("🔄 Fetching live data..."):
+# Show when next NSE update is expected
+if status_info['status'] == 'LIVE':
+    if st.session_state.last_data_time:
+        next_nse_update = st.session_state.last_data_time + timedelta(seconds=180)
+        current = get_ist_time()
+        if next_nse_update > current:
+            seconds_left = (next_nse_update - current).seconds
+            st.info(f"📊 NSE data updates every 3 minutes. Next update in ~{seconds_left} seconds", icon="⏳")
+
+with st.spinner(f"🔄 Fetching NSE data (updated every 3 minutes)..."):
     data, status_msg = fetch_pcr(base_strike, dte, manual_range)
 
 if data:
+    # Check if this is new data (based on timestamp)
+    is_new_data = True
+    if st.session_state.last_data_time and st.session_state.data_history:
+        time_diff = (data["time"] - st.session_state.data_history[-1]["time"]).total_seconds()
+        if time_diff < 60:  # Less than 1 minute difference
+            is_new_data = False
+            log(f"Data unchanged from previous fetch (timestamp: {data['timestamp']})", "INFO")
+    
     st.session_state.last_valid = data
-    st.session_state.data_history.append(data)
+    st.session_state.last_data_time = data["time"]
     
-    # Keep only last 50 data points for performance
-    if len(st.session_state.data_history) > 50:
-        st.session_state.data_history = st.session_state.data_history[-50:]
-    
-    log(f"PCR={data['pcr']} | Spot={data['spot']:.2f} | PutΔOI={data['put_doi']:,} | CallΔOI={data['call_doi']:,}")
-    
-    # Success animation
-    st.success("✅ Data updated successfully!", icon="✅")
+    if is_new_data:
+        st.session_state.data_history.append(data)
+        # Keep only last 50 data points for performance
+        if len(st.session_state.data_history) > 50:
+            st.session_state.data_history = st.session_state.data_history[-50:]
+        
+        log(f"PCR={data['pcr']} | Spot={data['spot']:.2f} | PutΔOI={data['put_doi']:,} | CallΔOI={data['call_doi']:,}")
+        
+        # Success animation
+        st.success(f"✅ Data updated at {data['time'].strftime('%H:%M:%S')} IST", icon="✅")
+    else:
+        st.info(f"🔄 Data unchanged (Last update: {data['time'].strftime('%H:%M:%S')} IST)", icon="ℹ️")
     
 elif st.session_state.last_valid:
     data = st.session_state.last_valid
-    st.warning("⚠️ Using cached data - API fetch failed", icon="⚠️")
+    st.warning(f"⚠️ Using cached data from {data['time'].strftime('%H:%M:%S')} - API fetch failed", icon="⚠️")
     log(f"API fetch failed: {status_msg}", "WARN")
 else:
     # Fixed error message without cross marks
-    st.error("Initial data fetch failed", icon="❌")
+    st.error(f"Initial data fetch failed: {status_msg}", icon="❌")
     log(f"Initial fetch failed: {status_msg}", "ERROR")
 
 # ================== PCR SIGNAL DISPLAY ==================
@@ -433,33 +567,40 @@ if data:
         <div class="metric-card fade-in" style="border-top:4px solid #2ecc71;">
             <div style="font-size:12px; color:#95a5a6;">SPOT PRICE</div>
             <div style="font-size:24px; font-weight:bold; color:#2ecc71;">₹{data['spot']:,.2f}</div>
+            <div style="font-size:10px; color:#95a5a6;">NSE Timestamp: {data.get('timestamp', 'N/A')}</div>
         </div>
         """, unsafe_allow_html=True)
     
     with col2:
         delta_color = "#2ecc71" if data['put_doi'] > data['call_doi'] else "#e74c3c"
+        put_doi_symbol = "📈" if data['put_doi'] > 0 else "📉" if data['put_doi'] < 0 else "➡️"
         st.markdown(f"""
         <div class="metric-card fade-in" style="border-top:4px solid {delta_color};">
-            <div style="font-size:12px; color:#95a5a6;">PUT ΔOI</div>
+            <div style="font-size:12px; color:#95a5a6;">PUT ΔOI {put_doi_symbol}</div>
             <div style="font-size:24px; font-weight:bold; color:{delta_color};">{data['put_doi']:,}</div>
+            <div style="font-size:10px; color:#95a5a6;">Change in Open Interest</div>
         </div>
         """, unsafe_allow_html=True)
     
     with col3:
         delta_color = "#e74c3c" if data['call_doi'] > data['put_doi'] else "#2ecc71"
+        call_doi_symbol = "📈" if data['call_doi'] > 0 else "📉" if data['call_doi'] < 0 else "➡️"
         st.markdown(f"""
         <div class="metric-card fade-in" style="border-top:4px solid {delta_color};">
-            <div style="font-size:12px; color:#95a5a6;">CALL ΔOI</div>
+            <div style="font-size:12px; color:#95a5a6;">CALL ΔOI {call_doi_symbol}</div>
             <div style="font-size:24px; font-weight:bold; color:{delta_color};">{data['call_doi']:,}</div>
+            <div style="font-size:10px; color:#95a5a6;">Change in Open Interest</div>
         </div>
         """, unsafe_allow_html=True)
     
     with col4:
         ratio_color = color
+        ratio_symbol = "📈" if data['pcr'] > 1.25 else "📉" if data['pcr'] < 0.75 else "➡️"
         st.markdown(f"""
         <div class="metric-card fade-in" style="border-top:4px solid {ratio_color};">
-            <div style="font-size:12px; color:#95a5a6;">PUT/CALL RATIO</div>
+            <div style="font-size:12px; color:#95a5a6;">PUT/CALL RATIO {ratio_symbol}</div>
             <div style="font-size:24px; font-weight:bold; color:{ratio_color};">{data['pcr']}</div>
+            <div style="font-size:10px; color:#95a5a6;">Based on ΔOI (not total OI)</div>
         </div>
         """, unsafe_allow_html=True)
 
@@ -468,7 +609,7 @@ if status_info["status"] == "AFTER_MARKET":
     st.markdown("---")
     
     with st.container():
-        st.markdown("### 🌙 After-Market Analysis")
+        st.markdown(f"### 🌙 After-Market Analysis (Next Market: {status_info['time_to_open']})")
         
         if st.session_state.data_history:
             # Create day summary
@@ -518,7 +659,7 @@ if status_info["status"] == "AFTER_MARKET":
                 st.download_button(
                     label="Download CSV",
                     data=csv,
-                    file_name=f"nifty_pcr_{datetime.now().strftime('%Y%m%d')}.csv",
+                    file_name=f"nifty_pcr_{get_ist_time().strftime('%Y%m%d')}.csv",
                     mime="text/csv"
                 )
 
@@ -538,12 +679,15 @@ if st.session_state.data_history:
         )
         show_avg = st.toggle("Show Moving Average", value=True)
         show_thresholds = st.toggle("Show Thresholds", value=True)
+        data_points = st.slider("Data Points", 10, 50, min(30, len(st.session_state.data_history)))
     
     with chart_col1:
         fig, ax = plt.subplots(figsize=(12, 5))
         
-        times = [d["time"] for d in st.session_state.data_history]
-        pcr_values = [d["pcr"] for d in st.session_state.data_history]
+        # Get recent data points
+        recent_data = st.session_state.data_history[-data_points:]
+        times = [d["time"] for d in recent_data]
+        pcr_values = [d["pcr"] for d in recent_data]
         
         if chart_type == "Line":
             ax.plot(times, pcr_values, 'o-', linewidth=2, color=sphere_color, 
@@ -565,9 +709,9 @@ if st.session_state.data_history:
             ax.axhline(1.0, color='white', linestyle='--', alpha=0.3, label='Neutral (1.0)')
             ax.axhline(0.75, color='#e74c3c', linestyle='--', alpha=0.5, label='Bearish (0.75)')
         
-        ax.set_title(f'PCR Trend | ATM {base_strike} | {len(times)} data points', 
+        ax.set_title(f'PCR Trend | ATM {base_strike} | {len(times)} data points (ΔOI-based)', 
                     fontsize=14, fontweight='bold')
-        ax.set_ylabel('PCR Value')
+        ax.set_ylabel('PCR Value (ΔOI Ratio)')
         ax.grid(True, alpha=0.2)
         ax.legend()
         plt.xticks(rotation=45)
@@ -595,14 +739,14 @@ with st.expander("🧠 Trader Psychology & Mindset", expanded=False):
         # UPDATED RISK MANAGEMENT RULES
         st.markdown("""
         <div style="background:#1c1f26; padding:15px; border-radius:10px; border-left:4px solid #e74c3c;">
-        <h4>🛡️ Risk Rules:</h4>
+        <h4>🛡️ NIFTY-SPECIFIC RULES:</h4>
         <ul>
         <li><strong>NO TRADE ON EXPIRY DAYS</strong> - Tuesday is NIFTY 50 weekly expiry</li>
-        <li><strong>Stop Trading After First Loss</strong> - Prevents revenge trading</li>
-        <li><strong>Avoid First 15 Minutes</strong> - No trades during market opening volatility</li>
-        <li>Use stop losses religiously</li>
-        <li>Position size based on conviction, not hope</li>
-        <li>Cut losses quickly, let winners run</li>
+        <li><strong>Stop After First Loss</strong> - No revenge trading, preserve capital</li>
+        <li><strong>No Trades in First 15 Minutes</strong> - Avoid opening volatility (9:15-9:30 IST)</li>
+        <li>Max 2% risk per trade, 5% max daily loss limit</li>
+        <li>PCR > 1.5 = Bullish bias, PCR < 0.8 = Bearish bias</li>
+        <li>Friday positions: Close or hedge before weekend</li>
         </ul>
         </div>
         """, unsafe_allow_html=True)
@@ -616,6 +760,7 @@ with st.expander("🧠 Trader Psychology & Mindset", expanded=False):
         <li>Entry is optional, exit is mandatory</li>
         <li>Discipline > Intelligence</li>
         <li>Review trades, not just results</li>
+        <li>Respect the 3-minute NSE update cycle for ΔOI data</li>
         </ul>
         </div>
         """, unsafe_allow_html=True)
@@ -649,7 +794,7 @@ with st.expander("📜 Activity Logs", expanded=False):
             st.markdown(f"""
             <div style="padding:8px; margin:4px 0; background:#1c1f26; 
                  border-radius:5px; border-left:4px solid {level_colors.get(log_entry['level'], '#95a5a6')};">
-                <span style="color:#95a5a6;">{log_entry['time'].strftime('%H:%M:%S')}</span>
+                <span style="color:#95a5a6;">{log_entry['time'].strftime('%H:%M:%S IST')}</span>
                 <span style="color:{level_colors.get(log_entry['level'], '#95a5a6')}; 
                       font-weight:bold; margin:0 10px;">[{log_entry['level']}]</span>
                 <span>{log_entry['message']}</span>
@@ -661,12 +806,12 @@ with st.expander("📜 Activity Logs", expanded=False):
 # ================== AUTO REFRESH LOGIC ==================
 if auto_refresh and 'refresh_interval' in locals():
     if st.session_state.last_refresh is None:
-        st.session_state.last_refresh = datetime.now()
+        st.session_state.last_refresh = get_ist_time()
     else:
-        elapsed = (datetime.now() - st.session_state.last_refresh).seconds
+        elapsed = (get_ist_time() - st.session_state.last_refresh).seconds
         
         if elapsed >= refresh_interval:
-            st.session_state.last_refresh = datetime.now()
+            st.session_state.last_refresh = get_ist_time()
             st.session_state.refresh_count += 1
             st.session_state.animation_key += 1
             
@@ -685,20 +830,21 @@ if auto_refresh and 'refresh_interval' in locals():
     # Countdown timer
     if st.session_state.last_refresh:
         next_refresh = st.session_state.last_refresh + timedelta(seconds=refresh_interval)
-        time_left = (next_refresh - datetime.now()).seconds
-        st.caption(f"⏳ Next auto-refresh in {time_left} seconds")
+        current_time = get_ist_time()
+        if next_refresh > current_time:
+            time_left = (next_refresh - current_time).seconds
+            st.caption(f"⏳ Next auto-refresh in {time_left} seconds")
 
 # ================== FOOTER ==================
 st.markdown("---")
-st.markdown("""
+st.markdown(f"""
 <div style="text-align:center; color:#95a5a6; font-size:12px; padding:20px;">
-    <div style="display:flex; justify-content:center; gap:30px; margin-bottom:10px;">
+    <div style="display:flex; justify-content:center; gap:30px; margin-bottom:10px; flex-wrap:wrap;">
         <span>📊 NIFTY ΔOI PCR Dashboard</span>
-        <span>⚡ Real-time PCR Analytics</span>
+        <span>⏰ IST: {get_ist_time().strftime('%d %b %Y, %I:%M %p')}</span>
+        <span>🔄 NSE Data: 3-min cycle</span>
         <span>🔐 For Educational Purposes</span>
     </div>
-    <div>Data Source: NSE India • Update Frequency: {refresh_interval if auto_refresh else 'Manual'} seconds</div>
+    <div>Data Source: NSE India • Based on ΔOI (Change in Open Interest) • PCR = Put ΔOI / Call ΔOI</div>
 </div>
 """, unsafe_allow_html=True)
-
-# python -m streamlit run app.py
